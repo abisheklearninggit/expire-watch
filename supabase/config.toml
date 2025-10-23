@@ -1,1 +1,7 @@
 project_id = "auyefebxgqyjyltbddcp"
+
+[auth]
+enabled = true
+
+[functions.scan-product]
+verify_jwt = false

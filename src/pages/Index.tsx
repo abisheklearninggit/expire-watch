@@ -1,5 +1,8 @@
 import { useState, useEffect } from 'react';
-import { Plus, Scan, ListFilter, Search, Package } from 'lucide-react';
+import { Plus, Scan, ListFilter, Search, Package, Bell, LogOut } from 'lucide-react';
+import { supabase } from '@/integrations/supabase/client';
+import { AuthForm } from '@/components/AuthForm';
+import { ReminderSettings } from '@/components/ReminderSettings';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ProductCard } from '@/components/ProductCard';
@@ -16,65 +19,160 @@ import {
 } from '@/components/ui/select';
 import { getExpiryStatus } from '@/utils/dateParser';
 
-const STORAGE_KEY = 'expiry-tracker-products';
-
 const Index = () => {
+  const [user, setUser] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
   const [products, setProducts] = useState<Product[]>([]);
   const [showScanner, setShowScanner] = useState(false);
   const [showManualEntry, setShowManualEntry] = useState(false);
+  const [showReminderSettings, setShowReminderSettings] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [filterStatus, setFilterStatus] = useState<'all' | 'fresh' | 'expiring-soon' | 'expired'>('all');
   
-  // Load products from localStorage
+  // Check authentication
   useEffect(() => {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) {
-      const parsed = JSON.parse(stored);
-      // Convert date strings back to Date objects
-      const productsWithDates = parsed.map((p: any) => ({
-        ...p,
-        addedDate: new Date(p.addedDate),
-        expiryDate: new Date(p.expiryDate),
-        manufacturingDate: p.manufacturingDate ? new Date(p.manufacturingDate) : undefined,
-      }));
-      setProducts(productsWithDates);
-    }
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user ?? null);
+      setLoading(false);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+
+    return () => subscription.unsubscribe();
   }, []);
   
-  // Save products to localStorage
+  // Load products from database
   useEffect(() => {
-    if (products.length > 0) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(products));
+    if (user) {
+      loadProducts();
     }
-  }, [products]);
-  
-  const handleProductScanned = (product: Omit<Product, 'id' | 'addedDate'>) => {
-    const newProduct: Product = {
-      ...product,
-      id: Date.now().toString(),
-      addedDate: new Date(),
-    };
-    
-    setProducts((prev) => [newProduct, ...prev]);
-    setShowScanner(false);
-    toast.success('Product added successfully!');
+  }, [user]);
+
+  const loadProducts = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('products')
+        .select('*')
+        .order('expiry_date', { ascending: true });
+
+      if (error) throw error;
+
+      const productsWithDates = (data || []).map((p: any) => ({
+        ...p,
+        addedDate: new Date(p.added_date),
+        expiryDate: new Date(p.expiry_date),
+        manufacturingDate: p.manufacturing_date ? new Date(p.manufacturing_date) : undefined,
+      }));
+
+      setProducts(productsWithDates);
+    } catch (error) {
+      console.error('Error loading products:', error);
+      toast.error('Failed to load products');
+    }
   };
   
-  const handleManualEntry = (product: Omit<Product, 'id' | 'addedDate'>) => {
-    const newProduct: Product = {
-      ...product,
-      id: Date.now().toString(),
-      addedDate: new Date(),
-    };
-    
-    setProducts((prev) => [newProduct, ...prev]);
-    setShowManualEntry(false);
-    toast.success('Product added successfully!');
+  const handleProductScanned = async (product: Omit<Product, 'id' | 'addedDate'>) => {
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error('Not authenticated');
+
+      const { error } = await supabase.from('products').insert({
+        user_id: user.id,
+        name: product.name,
+        image_url: product.imageUrl,
+        manufacturing_date: product.manufacturingDate?.toISOString(),
+        expiry_date: product.expiryDate.toISOString(),
+        category: product.category,
+        notes: product.notes,
+      });
+
+      if (error) throw error;
+
+      // Schedule notification for this product
+      const { data: settings } = await supabase
+        .from('reminder_settings')
+        .select('*')
+        .eq('user_id', user.id)
+        .maybeSingle();
+
+      if (settings?.enabled) {
+        const { scheduleExpiryNotification } = await import('@/utils/notifications');
+        await scheduleExpiryNotification(
+          product.name,
+          product.expiryDate,
+          settings.days_before_expiry
+        );
+      }
+
+      await loadProducts();
+      setShowScanner(false);
+      toast.success('Product added successfully!');
+    } catch (error) {
+      console.error('Error adding product:', error);
+      toast.error('Failed to add product');
+    }
   };
   
-  const handleDeleteProduct = (id: string) => {
-    setProducts((prev) => prev.filter((p) => p.id !== id));
-    toast.success('Product deleted');
+  const handleManualEntry = async (product: Omit<Product, 'id' | 'addedDate'>) => {
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error('Not authenticated');
+
+      const { error } = await supabase.from('products').insert({
+        user_id: user.id,
+        name: product.name,
+        image_url: product.imageUrl,
+        manufacturing_date: product.manufacturingDate?.toISOString(),
+        expiry_date: product.expiryDate.toISOString(),
+        category: product.category,
+        notes: product.notes,
+      });
+
+      if (error) throw error;
+
+      // Schedule notification for this product
+      const { data: settings } = await supabase
+        .from('reminder_settings')
+        .select('*')
+        .eq('user_id', user.id)
+        .maybeSingle();
+
+      if (settings?.enabled) {
+        const { scheduleExpiryNotification } = await import('@/utils/notifications');
+        await scheduleExpiryNotification(
+          product.name,
+          product.expiryDate,
+          settings.days_before_expiry
+        );
+      }
+
+      await loadProducts();
+      setShowManualEntry(false);
+      toast.success('Product added successfully!');
+    } catch (error) {
+      console.error('Error adding product:', error);
+      toast.error('Failed to add product');
+    }
+  };
+  
+  const handleDeleteProduct = async (id: string) => {
+    try {
+      const { error } = await supabase.from('products').delete().eq('id', id);
+      if (error) throw error;
+
+      await loadProducts();
+      toast.success('Product deleted');
+    } catch (error) {
+      console.error('Error deleting product:', error);
+      toast.error('Failed to delete product');
+    }
+  };
+
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+    toast.success('Signed out successfully');
   };
   
   const filteredProducts = products.filter((product) => {
@@ -91,6 +189,18 @@ const Index = () => {
     expired: products.filter((p) => getExpiryStatus(p.expiryDate) === 'expired').length,
   };
   
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-primary"></div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <AuthForm />;
+  }
+
   if (showScanner) {
     return <ScannerView onClose={() => setShowScanner(false)} onProductScanned={handleProductScanned} />;
   }
@@ -109,9 +219,31 @@ const Index = () => {
               <Package className="w-8 h-8" />
               <h1 className="text-2xl font-bold">FreshTrack</h1>
             </div>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => setShowReminderSettings(true)}
+                className="text-primary-foreground hover:bg-primary-foreground/20"
+              >
+                <Bell className="w-5 h-5" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={handleSignOut}
+                className="text-primary-foreground hover:bg-primary-foreground/20"
+              >
+                <LogOut className="w-5 h-5" />
+              </Button>
+            </div>
           </div>
         </div>
       </header>
+
+      {showReminderSettings && (
+        <ReminderSettings onClose={() => setShowReminderSettings(false)} />
+      )}
       
       <main className="container max-w-6xl mx-auto px-4 py-6 space-y-6">
         {/* Stats */}
